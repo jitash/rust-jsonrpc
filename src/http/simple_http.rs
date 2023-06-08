@@ -6,13 +6,14 @@
 
 #[cfg(feature = "proxy")]
 use socks::Socks5Stream;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader};
 #[cfg(not(jsonrpc_fuzz))]
 use std::net::TcpStream;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{error, fmt, io, net, num};
+use reqwest::StatusCode;
 
 use crate::client::Transport;
 use crate::http::DEFAULT_PORT;
@@ -33,6 +34,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1);
 /// running a bitcoind RPC client.
 #[derive(Clone, Debug)]
 pub struct SimpleHttpTransport {
+    url: String,
     addr: net::SocketAddr,
     path: String,
     timeout: Duration,
@@ -48,6 +50,7 @@ pub struct SimpleHttpTransport {
 impl Default for SimpleHttpTransport {
     fn default() -> Self {
         SimpleHttpTransport {
+            url: "http://localhost".to_string(),
             addr: net::SocketAddr::new(
                 net::IpAddr::V4(net::Ipv4Addr::new(127, 0, 0, 1)),
                 DEFAULT_PORT,
@@ -80,6 +83,7 @@ impl SimpleHttpTransport {
 
     /// Replaces the URL of the transport.
     pub fn set_url(&mut self, url: &str) -> Result<(), Error> {
+        self.url = url.to_string();
         let url = check_url(url)?;
         self.addr = url.0;
         self.path = url.1;
@@ -92,8 +96,8 @@ impl SimpleHttpTransport {
     }
 
     fn request<R>(&self, req: impl serde::Serialize) -> Result<R, Error>
-    where
-        R: for<'a> serde::de::Deserialize<'a>,
+        where
+            R: for<'a> serde::de::Deserialize<'a>,
     {
         match self.try_request(req) {
             Ok(response) => Ok(response),
@@ -129,145 +133,39 @@ impl SimpleHttpTransport {
     }
 
     fn try_request<R>(&self, req: impl serde::Serialize) -> Result<R, Error>
-    where
-        R: for<'a> serde::de::Deserialize<'a>,
+        where
+            R: for<'a> serde::de::Deserialize<'a>,
     {
-        // No part of this codebase should panic, so unwrapping a mutex lock is fine
-        let mut sock_lock: MutexGuard<Option<_>> = self.sock.lock().expect("poisoned mutex");
-        if sock_lock.is_none() {
-            *sock_lock = Some(BufReader::new(self.fresh_socket()?));
-        };
-        // In the immediately preceding block, we made sure that `sock` is non-`None`,
-        // so unwrapping here is fine.
-        let sock: &mut BufReader<_> = sock_lock.as_mut().unwrap();
-
-        // Serialize the body first so we can set the Content-Length header.
+        let start = Instant::now();
+        //// Serialize the body first so we can set the Content-Length header.
         let body = serde_json::to_vec(&req)?;
 
-        let mut request_bytes = Vec::new();
-
-        request_bytes.write_all(b"POST ")?;
-        request_bytes.write_all(self.path.as_bytes())?;
-        request_bytes.write_all(b" HTTP/1.1\r\n")?;
-        // Write headers
-        request_bytes.write_all(b"host: ")?;
-        request_bytes.write_all(self.addr.to_string().as_bytes())?;
-        request_bytes.write_all(b"\r\n")?;
-        request_bytes.write_all(b"Content-Type: application/json\r\n")?;
-        request_bytes.write_all(b"Content-Length: ")?;
-        request_bytes.write_all(body.len().to_string().as_bytes())?;
-        request_bytes.write_all(b"\r\n")?;
-        if let Some(ref auth) = self.basic_auth {
-            request_bytes.write_all(b"Authorization: ")?;
-            request_bytes.write_all(auth.as_ref())?;
-            request_bytes.write_all(b"\r\n")?;
-        }
-        // Write body
-        request_bytes.write_all(b"\r\n")?;
-        request_bytes.write_all(&body)?;
-
-        // Send HTTP request
-        let write_success = sock.get_mut().write_all(request_bytes.as_slice()).is_ok()
-            && sock.get_mut().flush().is_ok();
-
-        // This indicates the socket is broken so let's retry the send once with a fresh socket
-        if !write_success {
-            *sock.get_mut() = self.fresh_socket()?;
-            sock.get_mut().write_all(request_bytes.as_slice())?;
-            sock.get_mut().flush()?;
-        }
-
-        // Parse first HTTP response header line
-        let mut header_buf = String::new();
-        let read_success = sock.read_line(&mut header_buf).is_ok();
-
-        // This is another possible indication that the socket is broken so let's retry the send once
-        // with a fresh socket IF the write attempt has not already experienced a failure
-        if (!read_success || header_buf.is_empty()) && write_success {
-            *sock.get_mut() = self.fresh_socket()?;
-            sock.get_mut().write_all(request_bytes.as_slice())?;
-            sock.get_mut().flush()?;
-
-            sock.read_line(&mut header_buf)?;
-        }
-
-        if header_buf.len() < 12 {
-            return Err(Error::HttpResponseTooShort {
-                actual: header_buf.len(),
-                needed: 12,
-            });
-        }
-        if !header_buf.as_bytes()[..12].is_ascii() {
-            return Err(Error::HttpResponseNonAsciiHello(header_buf.as_bytes()[..12].to_vec()));
-        }
-        if !header_buf.starts_with("HTTP/1.1 ") {
-            return Err(Error::HttpResponseBadHello {
-                actual: header_buf[0..9].into(),
-                expected: "HTTP/1.1 ".into(),
-            });
-        }
-        let response_code = match header_buf[9..12].parse::<u16>() {
-            Ok(n) => n,
-            Err(e) => return Err(Error::HttpResponseBadStatus(header_buf[9..12].into(), e)),
-        };
-
-        // Parse response header fields
-        let mut content_length = None;
-        loop {
-            header_buf.clear();
-            sock.read_line(&mut header_buf)?;
-            if header_buf == "\r\n" {
-                break;
-            }
-            header_buf.make_ascii_lowercase();
-
-            const CONTENT_LENGTH: &str = "content-length: ";
-            if let Some(s) = header_buf.strip_prefix(CONTENT_LENGTH) {
-                content_length = Some(
-                    s.trim()
-                        .parse::<u64>()
-                        .map_err(|e| Error::HttpResponseBadContentLength(s.into(), e))?,
-                );
-            }
-        }
-
-        if response_code == 401 {
-            // There is no body in a 401 response, so don't try to read it
-            return Err(Error::HttpErrorCode(response_code));
-        }
-
-        // Read up to `content_length` bytes. Note that if there is no content-length
-        // header, we will assume an effectively infinite content length, i.e. we will
-        // just keep reading from the socket until it is closed.
-        let mut reader = match content_length {
-            None => sock.take(FINAL_RESP_ALLOC),
-            Some(n) if n > FINAL_RESP_ALLOC => {
-                return Err(Error::HttpResponseContentLengthTooLarge {
-                    length: n,
-                    max: FINAL_RESP_ALLOC,
-                });
-            }
-            Some(n) => sock.take(n),
-        };
-
-        // Attempt to parse the response. Don't check the HTTP error code until
-        // after parsing, since Bitcoin Core will often return a descriptive JSON
-        // error structure which is more useful than the error code.
-        match serde_json::from_reader(&mut reader) {
-            Ok(s) => {
-                if content_length.is_some() {
-                    reader.bytes().count(); // consume any trailing bytes
+        match String::from_utf8(body.clone()) {
+            Ok(string) => {
+                let client = reqwest::blocking::Client::new();
+                let json: serde_json::Value = serde_json::from_str(&string).unwrap();
+                let req = client.post(&self.url).json(&json);
+                let resp = req.send();
+                match resp {
+                    Ok(response) => {
+                        //println!("response: {:?}\n-------------------------------\n", response);
+                        match response.status() {
+                            StatusCode::OK => {
+                                println!("success! time consumed is: {:?}", start.elapsed());
+                                Ok(response.json().unwrap())
+                            }
+                            s => {
+                                println!("error {}", s);
+                                Err(Error::HttpErrorCode(1))
+                            }
+                        }
+                    }
+                    Err(error) => Err(Error::HttpErrorCode(1))
                 }
-                Ok(s)
             }
-            Err(e) => {
-                // If the response was not 200, assume the parse failed because of that
-                if response_code != 200 {
-                    Err(Error::HttpErrorCode(response_code))
-                } else {
-                    // If it was 200 then probably it was legitimately a parse error
-                    Err(e.into())
-                }
+            Err(error) => {
+                println!("body: Error converting bytes to string: {}", error);
+                Err(Error::HttpErrorCode(1))
             }
         }
     }
@@ -630,6 +528,7 @@ struct TcpStream;
 #[cfg(jsonrpc_fuzz)]
 mod impls {
     use super::*;
+
     impl Read for TcpStream {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             match *FUZZ_TCP_SOCK.lock().unwrap() {
@@ -638,6 +537,7 @@ mod impls {
             }
         }
     }
+
     impl Write for TcpStream {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             io::sink().write(buf)
@@ -762,7 +662,7 @@ mod tests {
             "127.0.0.1:9050",
             Some(("user", "password")),
         )
-        .unwrap();
+            .unwrap();
     }
 
     /// Test that the client will detect that a socket is closed and open a fresh one before sending
