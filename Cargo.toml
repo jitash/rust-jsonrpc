@@ -1,11 +1,11 @@
 [package]
-name = "jsonrpc"
+name = "jitash-jsonrpc"
 version = "0.15.0"
-authors = ["Andrew Poelstra <apoelstra@wpsoftware.net>"]
+authors = ["Jitash <jitash.cn@gmail.com>"]
 license = "CC0-1.0"
-homepage = "https://github.com/apoelstra/rust-jsonrpc/"
-repository = "https://github.com/apoelstra/rust-jsonrpc/"
-documentation = "https://docs.rs/jsonrpc/"
+homepage = "https://github.com/jitash/rust-jsonrpc/"
+repository = "https://github.com/jitash/rust-jsonrpc/"
+documentation = "https://docs.rs/jitash-jsonrpc/"
 description = "Rust support for the JSON-RPC 2.0 protocol"
 keywords = [ "protocol", "json", "http", "jsonrpc" ]
 readme	 = "README.md"
