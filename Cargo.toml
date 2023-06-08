@@ -1,7 +1,7 @@
 [package]
 name = "jitash-jsonrpc"
 version = "0.15.0"
-authors = ["Jitash <jitash.cn@gmail.com>"]
+authors = ["Jitash <jitash@foxmail.com>"]
 license = "CC0-1.0"
 homepage = "https://github.com/jitash/rust-jsonrpc/"
 repository = "https://github.com/jitash/rust-jsonrpc/"
